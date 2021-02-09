@@ -12,6 +12,8 @@ import (
 type Constraint struct {
 	f        constraintFunc
 	check    *Version
+	fV2      constraintFunc
+	checkV2  *Version
 	original string
 }
 
@@ -24,6 +26,11 @@ type constraintFunc func(v, c *Version) bool
 var constraintOperators map[string]constraintFunc
 
 var constraintRegexp *regexp.Regexp
+
+var (
+	constraintOperatorsV2 map[string]constraintFunc
+	constraintRegexpV2    *regexp.Regexp
+)
 
 func init() {
 	constraintOperators = map[string]constraintFunc{
@@ -45,6 +52,27 @@ func init() {
 	constraintRegexp = regexp.MustCompile(fmt.Sprintf(
 		`^\s*(%s)\s*(%s)\s*$`,
 		strings.Join(ops, "|"),
+		VersionRegexpRaw))
+
+	constraintOperatorsV2 = map[string]constraintFunc{
+		"":   constraintEqual,
+		"=":  constraintEqual,
+		"!=": constraintNotEqual,
+		">":  constraintGreaterThanV2,
+		"<":  constraintLessThanV2,
+		">=": constraintGreaterThanEqualV2,
+		"<=": constraintLessThanEqualV2,
+		"~>": constraintPessimisticV2,
+	}
+
+	opsV2 := make([]string, 0, len(constraintOperatorsV2))
+	for k := range constraintOperatorsV2 {
+		opsV2 = append(opsV2, regexp.QuoteMeta(k))
+	}
+
+	constraintRegexpV2 = regexp.MustCompile(fmt.Sprintf(
+		`^\s*(%s)\s*(%s)\s*$`,
+		strings.Join(opsV2, "|"),
 		VersionRegexpRaw))
 }
 
@@ -77,6 +105,16 @@ func (cs Constraints) Check(v *Version) bool {
 	return true
 }
 
+func (cs Constraints) CheckV2(v *Version) bool {
+	for _, c := range cs {
+		if !c.CheckV2(v) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // Returns the string format of the constraints
 func (cs Constraints) String() string {
 	csStr := make([]string, len(cs))
@@ -90,6 +128,10 @@ func (cs Constraints) String() string {
 // Check tests if a constraint is validated by the given version.
 func (c *Constraint) Check(v *Version) bool {
 	return c.f(v, c.check)
+}
+
+func (c *Constraint) CheckV2(v *Version) bool {
+	return c.fV2(v, c.checkV2)
 }
 
 func (c *Constraint) String() string {
@@ -107,9 +149,21 @@ func parseSingle(v string) (*Constraint, error) {
 		return nil, err
 	}
 
+	matchesV2 := constraintRegexpV2.FindStringSubmatch(v)
+	if matchesV2 == nil {
+		return nil, fmt.Errorf("Malformed constraint v2: %s", v)
+	}
+
+	checkV2, err := NewVersion(matchesV2[2])
+	if err != nil {
+		return nil, err
+	}
+
 	return &Constraint{
 		f:        constraintOperators[matches[1]],
 		check:    check,
+		fV2:      constraintOperatorsV2[matchesV2[1]],
+		checkV2:  checkV2,
 		original: v,
 	}, nil
 }
@@ -134,9 +188,9 @@ func prereleaseCheck(v, c *Version) bool {
 	return true
 }
 
-//-------------------------------------------------------------------
+// -------------------------------------------------------------------
 // Constraint functions
-//-------------------------------------------------------------------
+// -------------------------------------------------------------------
 
 func constraintEqual(v, c *Version) bool {
 	return v.Equal(c)
@@ -168,6 +222,64 @@ func constraintPessimistic(v, c *Version) bool {
 		return false
 	}
 
+	// If the version being checked is naturally less than the constraint, then there
+	// is no way for the version to be valid against the constraint
+	if v.LessThan(c) {
+		return false
+	}
+	// We'll use this more than once, so grab the length now so it's a little cleaner
+	// to write the later checks
+	cs := len(c.segments)
+
+	// If the version being checked has less specificity than the constraint, then there
+	// is no way for the version to be valid against the constraint
+	if cs > len(v.segments) {
+		return false
+	}
+
+	// Check the segments in the constraint against those in the version. If the version
+	// being checked, at any point, does not have the same values in each index of the
+	// constraints segments, then it cannot be valid against the constraint.
+	for i := 0; i < c.si-1; i++ {
+		if v.segments[i] != c.segments[i] {
+			return false
+		}
+	}
+
+	// Check the last part of the segment in the constraint. If the version segment at
+	// this index is less than the constraints segment at this index, then it cannot
+	// be valid against the constraint
+	if c.segments[cs-1] > v.segments[cs-1] {
+		return false
+	}
+
+	// If nothing has rejected the version by now, it's valid
+	return true
+}
+
+// The only difference between the old checkers and the V2 checkers is that they
+// skip checking the pre-release of the versions, it proved to be problematic as the
+// constraints had no pre-release and the given versions did have, as a result the
+// checkers always returned false.
+// For example: ">= 1.0.0, <= 1.20.0" "1.16.5-eks-9e69307" would return false.
+
+func constraintGreaterThanV2(v, c *Version) bool {
+	return v.Compare(c) == 1
+}
+
+func constraintLessThanV2(v, c *Version) bool {
+	return v.Compare(c) == -1
+}
+
+func constraintGreaterThanEqualV2(v, c *Version) bool {
+	return v.Compare(c) >= 0
+}
+
+func constraintLessThanEqualV2(v, c *Version) bool {
+	return v.Compare(c) <= 0
+}
+
+func constraintPessimisticV2(v, c *Version) bool {
 	// If the version being checked is naturally less than the constraint, then there
 	// is no way for the version to be valid against the constraint
 	if v.LessThan(c) {
